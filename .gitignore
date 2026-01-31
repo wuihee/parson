@@ -6,3 +6,7 @@ tests/test_2_serialized.txt
 tests/test_2_serialized_pretty.txt
 test_hash_collisions
 build/**
+
+test.dSYM
+test_hash_collisions.dsYM
+testcpp.dSYM
