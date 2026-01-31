@@ -26,4 +26,3 @@ install(
     NAMESPACE parson::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
 )
-
