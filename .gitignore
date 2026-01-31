@@ -8,5 +8,5 @@ test_hash_collisions
 build/**
 
 test.dSYM
-test_hash_collisions.dsYM
+test_hash_collisions.dSYM
 testcpp.dSYM
