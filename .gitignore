@@ -10,3 +10,5 @@ build/**
 test.dSYM
 test_hash_collisions.dSYM
 testcpp.dSYM
+test_asan
+test_asan.dSYM

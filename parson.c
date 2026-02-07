@@ -65,7 +65,6 @@
 #endif
 #define strcpy USE_MEMCPY_INSTEAD_OF_STRCPY
 
-#define STARTING_CAPACITY 16
 #define MAX_NESTING 2048
 
 #ifndef PARSON_DEFAULT_FLOAT_FORMAT
@@ -89,8 +88,6 @@
   while (isspace((unsigned char)(**str))) {                                    \
     SKIP_CHAR(str);                                                            \
   }
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-
 #undef malloc
 #undef free
 
@@ -99,8 +96,6 @@
 #else
 #define IS_NUMBER_INVALID(x) (((x) * 0.0) != 0.0)
 #endif
-
-#define OBJECT_INVALID_IX ((size_t)-1)
 
 static JSON_Malloc_Function parson_malloc = malloc;
 static JSON_Free_Function parson_free = free;
@@ -141,23 +136,19 @@ struct json_value_t {
   JSON_Value_Value value;
 };
 
+typedef struct json_object_pair {
+  char *key;
+  JSON_Value *value;
+} JSON_Object_Pair;
+
 struct json_object_t {
   JSON_Value *wrapping_value;
-  size_t *cells;
-  unsigned long *hashes;
-  char **names;
-  JSON_Value **values;
-  size_t *cell_ixs;
-  size_t count;
-  size_t item_capacity;
-  size_t cell_capacity;
+  JSON_Object_Pair *pairs; /* stb_ds string hash map */
 };
 
 struct json_array_t {
   JSON_Value *wrapping_value;
-  JSON_Value **items;
-  size_t count;
-  size_t capacity;
+  JSON_Value **items; /* stb_ds dynamic array */
 };
 
 /* Various */
@@ -174,18 +165,9 @@ static int num_bytes_in_utf8_sequence(unsigned char c);
 static JSON_Status verify_utf8_sequence(const unsigned char *string, int *len);
 static parson_bool_t is_valid_utf8(const char *string, size_t string_len);
 static parson_bool_t is_decimal(const char *string, size_t length);
-static unsigned long hash_string(const char *string, size_t n);
 
 /* JSON Object */
 static JSON_Object *json_object_make(JSON_Value *wrapping_value);
-static JSON_Status json_object_init(JSON_Object *object, size_t capacity);
-static void json_object_deinit(JSON_Object *object, parson_bool_t free_keys,
-                               parson_bool_t free_values);
-static JSON_Status json_object_grow_and_rehash(JSON_Object *object);
-static size_t json_object_get_cell_ix(const JSON_Object *object,
-                                      const char *key, size_t key_len,
-                                      unsigned long hash,
-                                      parson_bool_t *out_found);
 static JSON_Status json_object_add(JSON_Object *object, char *name,
                                    JSON_Value *value);
 static JSON_Value *json_object_getn_value(const JSON_Object *object,
@@ -201,7 +183,6 @@ static void json_object_free(JSON_Object *object);
 /* JSON Array */
 static JSON_Array *json_array_make(JSON_Value *wrapping_value);
 static JSON_Status json_array_add(JSON_Array *array, JSON_Value *value);
-static JSON_Status json_array_resize(JSON_Array *array, size_t new_capacity);
 static void json_array_free(JSON_Array *array);
 
 /* JSON Value */
@@ -445,295 +426,79 @@ static parson_bool_t is_decimal(const char *string, size_t length) {
   return PARSON_TRUE;
 }
 
-static unsigned long hash_string(const char *string, size_t n) {
-#ifdef PARSON_FORCE_HASH_COLLISIONS
-  (void)string;
-  (void)n;
-  return 0;
-#else
-  unsigned long hash = 5381;
-  unsigned char c;
-  size_t i = 0;
-  for (i = 0; i < n; i++) {
-    c = string[i];
-    if (c == '\0') {
-      break;
-    }
-    hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
-  }
-  return hash;
-#endif
-}
-
 /* JSON Object */
 static JSON_Object *json_object_make(JSON_Value *wrapping_value) {
-  JSON_Status res = JSONFailure;
   JSON_Object *new_obj = (JSON_Object *)parson_malloc(sizeof(JSON_Object));
   if (new_obj == NULL) {
     return NULL;
   }
   new_obj->wrapping_value = wrapping_value;
-  res = json_object_init(new_obj, 0);
-  if (res != JSONSuccess) {
-    parson_free(new_obj);
-    return NULL;
-  }
+  new_obj->pairs = NULL;
+  sh_new_strdup(new_obj->pairs);
   return new_obj;
-}
-
-static JSON_Status json_object_init(JSON_Object *object, size_t capacity) {
-  unsigned int i = 0;
-
-  object->cells = NULL;
-  object->names = NULL;
-  object->values = NULL;
-  object->cell_ixs = NULL;
-  object->hashes = NULL;
-
-  object->count = 0;
-  object->cell_capacity = capacity;
-  object->item_capacity = (unsigned int)(capacity * 7 / 10);
-
-  if (capacity == 0) {
-    return JSONSuccess;
-  }
-
-  object->cells =
-      (size_t *)parson_malloc(object->cell_capacity * sizeof(*object->cells));
-  object->names =
-      (char **)parson_malloc(object->item_capacity * sizeof(*object->names));
-  object->values = (JSON_Value **)parson_malloc(object->item_capacity *
-                                                sizeof(*object->values));
-  object->cell_ixs = (size_t *)parson_malloc(object->item_capacity *
-                                             sizeof(*object->cell_ixs));
-  object->hashes = (unsigned long *)parson_malloc(object->item_capacity *
-                                                  sizeof(*object->hashes));
-  if (object->cells == NULL || object->names == NULL ||
-      object->values == NULL || object->cell_ixs == NULL ||
-      object->hashes == NULL) {
-    goto error;
-  }
-  for (i = 0; i < object->cell_capacity; i++) {
-    object->cells[i] = OBJECT_INVALID_IX;
-  }
-  return JSONSuccess;
-error:
-  parson_free(object->cells);
-  parson_free(object->names);
-  parson_free(object->values);
-  parson_free(object->cell_ixs);
-  parson_free(object->hashes);
-  return JSONFailure;
-}
-
-static void json_object_deinit(JSON_Object *object, parson_bool_t free_keys,
-                               parson_bool_t free_values) {
-  unsigned int i = 0;
-  for (i = 0; i < object->count; i++) {
-    if (free_keys) {
-      parson_free(object->names[i]);
-    }
-    if (free_values) {
-      json_value_free(object->values[i]);
-    }
-  }
-
-  object->count = 0;
-  object->item_capacity = 0;
-  object->cell_capacity = 0;
-
-  parson_free(object->cells);
-  parson_free(object->names);
-  parson_free(object->values);
-  parson_free(object->cell_ixs);
-  parson_free(object->hashes);
-
-  object->cells = NULL;
-  object->names = NULL;
-  object->values = NULL;
-  object->cell_ixs = NULL;
-  object->hashes = NULL;
-}
-
-static JSON_Status json_object_grow_and_rehash(JSON_Object *object) {
-  JSON_Value *wrapping_value = NULL;
-  JSON_Object new_object;
-  char *key = NULL;
-  JSON_Value *value = NULL;
-  unsigned int i = 0;
-  size_t new_capacity = MAX(object->cell_capacity * 2, STARTING_CAPACITY);
-  JSON_Status res = json_object_init(&new_object, new_capacity);
-  if (res != JSONSuccess) {
-    return JSONFailure;
-  }
-
-  wrapping_value = json_object_get_wrapping_value(object);
-  new_object.wrapping_value = wrapping_value;
-
-  for (i = 0; i < object->count; i++) {
-    key = object->names[i];
-    value = object->values[i];
-    res = json_object_add(&new_object, key, value);
-    if (res != JSONSuccess) {
-      json_object_deinit(&new_object, PARSON_FALSE, PARSON_FALSE);
-      return JSONFailure;
-    }
-    value->parent = wrapping_value;
-  }
-  json_object_deinit(object, PARSON_FALSE, PARSON_FALSE);
-  *object = new_object;
-  return JSONSuccess;
-}
-
-static size_t json_object_get_cell_ix(const JSON_Object *object,
-                                      const char *key, size_t key_len,
-                                      unsigned long hash,
-                                      parson_bool_t *out_found) {
-  size_t cell_ix = hash & (object->cell_capacity - 1);
-  size_t cell = 0;
-  size_t ix = 0;
-  unsigned int i = 0;
-  unsigned long hash_to_check = 0;
-  const char *key_to_check = NULL;
-  size_t key_to_check_len = 0;
-
-  *out_found = PARSON_FALSE;
-
-  for (i = 0; i < object->cell_capacity; i++) {
-    ix = (cell_ix + i) & (object->cell_capacity - 1);
-    cell = object->cells[ix];
-    if (cell == OBJECT_INVALID_IX) {
-      return ix;
-    }
-    hash_to_check = object->hashes[cell];
-    if (hash != hash_to_check) {
-      continue;
-    }
-    key_to_check = object->names[cell];
-    key_to_check_len = strlen(key_to_check);
-    if (key_to_check_len == key_len &&
-        strncmp(key, key_to_check, key_len) == 0) {
-      *out_found = PARSON_TRUE;
-      return ix;
-    }
-  }
-  return OBJECT_INVALID_IX;
 }
 
 static JSON_Status json_object_add(JSON_Object *object, char *name,
                                    JSON_Value *value) {
-  unsigned long hash = 0;
-  parson_bool_t found = PARSON_FALSE;
-  size_t cell_ix = 0;
-  JSON_Status res = JSONFailure;
-
+  ptrdiff_t idx;
   if (!object || !name || !value) {
     return JSONFailure;
   }
-
-  hash = hash_string(name, strlen(name));
-  found = PARSON_FALSE;
-  cell_ix = json_object_get_cell_ix(object, name, strlen(name), hash, &found);
-  if (found) {
-    return JSONFailure;
+  idx = shgeti(object->pairs, name);
+  if (idx >= 0) {
+    return JSONFailure; /* key already exists */
   }
-
-  if (object->count >= object->item_capacity) {
-    res = json_object_grow_and_rehash(object);
-    if (res != JSONSuccess) {
-      return JSONFailure;
-    }
-    cell_ix = json_object_get_cell_ix(object, name, strlen(name), hash, &found);
-  }
-
-  object->names[object->count] = name;
-  object->cells[cell_ix] = object->count;
-  object->values[object->count] = value;
-  object->cell_ixs[object->count] = cell_ix;
-  object->hashes[object->count] = hash;
-  object->count++;
+  shput(object->pairs, name, value);
+  parson_free(name); /* stb_ds duplicated the key */
   value->parent = json_object_get_wrapping_value(object);
-
   return JSONSuccess;
 }
 
 static JSON_Value *json_object_getn_value(const JSON_Object *object,
                                           const char *name, size_t name_len) {
-  unsigned long hash = 0;
-  parson_bool_t found = PARSON_FALSE;
-  size_t cell_ix = 0;
-  size_t item_ix = 0;
+  JSON_Object_Pair *pairs = NULL;
+  JSON_Object_Pair *pair = NULL;
+  char stack_buf[256];
+  char *temp_name = NULL;
   if (!object || !name) {
     return NULL;
   }
-  hash = hash_string(name, name_len);
-  found = PARSON_FALSE;
-  cell_ix = json_object_get_cell_ix(object, name, name_len, hash, &found);
-  if (!found) {
+  if (name_len < sizeof(stack_buf)) {
+    memcpy(stack_buf, name, name_len);
+    stack_buf[name_len] = '\0';
+    temp_name = stack_buf;
+  } else {
+    temp_name = parson_strndup(name, name_len);
+    if (!temp_name) {
+      return NULL;
+    }
+  }
+  pairs = object->pairs; /* non-const copy for stb_ds macros */
+  pair = shgetp_null(pairs, temp_name);
+  if (temp_name != stack_buf) {
+    parson_free(temp_name);
+  }
+  if (!pair) {
     return NULL;
   }
-  item_ix = object->cells[cell_ix];
-  return object->values[item_ix];
+  return pair->value;
 }
 
 static JSON_Status json_object_remove_internal(JSON_Object *object,
                                                const char *name,
                                                parson_bool_t free_value) {
-  unsigned long hash = 0;
-  parson_bool_t found = PARSON_FALSE;
-  size_t cell = 0;
-  size_t item_ix = 0;
-  size_t last_item_ix = 0;
-  size_t i = 0;
-  size_t j = 0;
-  size_t x = 0;
-  size_t k = 0;
-  JSON_Value *val = NULL;
-
+  ptrdiff_t idx;
   if (object == NULL) {
     return JSONFailure;
   }
-
-  hash = hash_string(name, strlen(name));
-  found = PARSON_FALSE;
-  cell = json_object_get_cell_ix(object, name, strlen(name), hash, &found);
-  if (!found) {
+  idx = shgeti(object->pairs, name);
+  if (idx < 0) {
     return JSONFailure;
   }
-
-  item_ix = object->cells[cell];
   if (free_value) {
-    val = object->values[item_ix];
-    json_value_free(val);
-    val = NULL;
+    json_value_free(object->pairs[idx].value);
   }
-
-  parson_free(object->names[item_ix]);
-  last_item_ix = object->count - 1;
-  if (item_ix < last_item_ix) {
-    object->names[item_ix] = object->names[last_item_ix];
-    object->values[item_ix] = object->values[last_item_ix];
-    object->cell_ixs[item_ix] = object->cell_ixs[last_item_ix];
-    object->hashes[item_ix] = object->hashes[last_item_ix];
-    object->cells[object->cell_ixs[item_ix]] = item_ix;
-  }
-  object->count--;
-
-  i = cell;
-  j = i;
-  for (x = 0; x < (object->cell_capacity - 1); x++) {
-    j = (j + 1) & (object->cell_capacity - 1);
-    if (object->cells[j] == OBJECT_INVALID_IX) {
-      break;
-    }
-    k = object->hashes[object->cells[j]] & (object->cell_capacity - 1);
-    if ((j > i && (k <= i || k > j)) || (j < i && (k <= i && k > j))) {
-      object->cell_ixs[object->cells[j]] = i;
-      object->cells[i] = object->cells[j];
-      i = j;
-    }
-  }
-  object->cells[i] = OBJECT_INVALID_IX;
+  shdel(object->pairs, name);
   return JSONSuccess;
 }
 
@@ -755,7 +520,12 @@ static JSON_Status json_object_dotremove_internal(JSON_Object *object,
 }
 
 static void json_object_free(JSON_Object *object) {
-  json_object_deinit(object, PARSON_TRUE, PARSON_TRUE);
+  size_t i = 0;
+  size_t count = shlenu(object->pairs);
+  for (i = 0; i < count; i++) {
+    json_value_free(object->pairs[i].value);
+  }
+  shfree(object->pairs);
   parson_free(object);
 }
 
@@ -766,49 +536,23 @@ static JSON_Array *json_array_make(JSON_Value *wrapping_value) {
     return NULL;
   }
   new_array->wrapping_value = wrapping_value;
-  new_array->items = (JSON_Value **)NULL;
-  new_array->capacity = 0;
-  new_array->count = 0;
+  new_array->items = NULL;
   return new_array;
 }
 
 static JSON_Status json_array_add(JSON_Array *array, JSON_Value *value) {
-  if (array->count >= array->capacity) {
-    size_t new_capacity = MAX(array->capacity * 2, STARTING_CAPACITY);
-    if (json_array_resize(array, new_capacity) != JSONSuccess) {
-      return JSONFailure;
-    }
-  }
   value->parent = json_array_get_wrapping_value(array);
-  array->items[array->count] = value;
-  array->count++;
-  return JSONSuccess;
-}
-
-static JSON_Status json_array_resize(JSON_Array *array, size_t new_capacity) {
-  JSON_Value **new_items = NULL;
-  if (new_capacity == 0) {
-    return JSONFailure;
-  }
-  new_items = (JSON_Value **)parson_malloc(new_capacity * sizeof(JSON_Value *));
-  if (new_items == NULL) {
-    return JSONFailure;
-  }
-  if (array->items != NULL && array->count > 0) {
-    memcpy(new_items, array->items, array->count * sizeof(JSON_Value *));
-  }
-  parson_free(array->items);
-  array->items = new_items;
-  array->capacity = new_capacity;
+  arrput(array->items, value);
   return JSONSuccess;
 }
 
 static void json_array_free(JSON_Array *array) {
   size_t i;
-  for (i = 0; i < array->count; i++) {
+  size_t count = arrlenu(array->items);
+  for (i = 0; i < count; i++) {
     json_value_free(array->items[i]);
   }
-  parson_free(array->items);
+  arrfree(array->items);
   parson_free(array);
 }
 
@@ -1131,9 +875,7 @@ static JSON_Value *parse_array_value(const char **string, size_t nesting) {
     }
   }
   SKIP_WHITESPACES(string);
-  if (**string != ']' || /* Trim array after parsing is over */
-      json_array_resize(output_array, json_array_get_count(output_array)) !=
-          JSONSuccess) {
+  if (**string != ']') {
     json_value_free(output_value);
     return NULL;
   }
@@ -1629,21 +1371,21 @@ int json_object_dotget_boolean(const JSON_Object *object, const char *name) {
 }
 
 size_t json_object_get_count(const JSON_Object *object) {
-  return object ? object->count : 0;
+  return object ? (size_t)shlenu(object->pairs) : 0;
 }
 
 const char *json_object_get_name(const JSON_Object *object, size_t index) {
   if (object == NULL || index >= json_object_get_count(object)) {
     return NULL;
   }
-  return object->names[index];
+  return object->pairs[index].key;
 }
 
 JSON_Value *json_object_get_value_at(const JSON_Object *object, size_t index) {
   if (object == NULL || index >= json_object_get_count(object)) {
     return NULL;
   }
-  return object->values[index];
+  return object->pairs[index].value;
 }
 
 JSON_Value *json_object_get_wrapping_value(const JSON_Object *object) {
@@ -1706,7 +1448,7 @@ int json_array_get_boolean(const JSON_Array *array, size_t index) {
 }
 
 size_t json_array_get_count(const JSON_Array *array) {
-  return array ? array->count : 0;
+  return array ? arrlenu(array->items) : 0;
 }
 
 JSON_Value *json_array_get_wrapping_value(const JSON_Array *array) {
@@ -2088,14 +1830,11 @@ char *json_serialize_to_string_pretty(const JSON_Value *value) {
 void json_free_serialized_string(char *string) { parson_free(string); }
 
 JSON_Status json_array_remove(JSON_Array *array, size_t ix) {
-  size_t to_move_bytes = 0;
   if (array == NULL || ix >= json_array_get_count(array)) {
     return JSONFailure;
   }
   json_value_free(json_array_get_value(array, ix));
-  to_move_bytes = (json_array_get_count(array) - 1 - ix) * sizeof(JSON_Value *);
-  memmove(array->items + ix, array->items + ix + 1, to_move_bytes);
-  array->count -= 1;
+  arrdel(array->items, (int)ix);
   return JSONSuccess;
 }
 
@@ -2177,13 +1916,16 @@ JSON_Status json_array_replace_null(JSON_Array *array, size_t i) {
 
 JSON_Status json_array_clear(JSON_Array *array) {
   size_t i = 0;
+  size_t count = 0;
   if (array == NULL) {
     return JSONFailure;
   }
-  for (i = 0; i < json_array_get_count(array); i++) {
-    json_value_free(json_array_get_value(array, i));
+  count = arrlenu(array->items);
+  for (i = 0; i < count; i++) {
+    json_value_free(array->items[i]);
   }
-  array->count = 0;
+  arrfree(array->items);
+  array->items = NULL;
   return JSONSuccess;
 }
 
@@ -2257,44 +1999,18 @@ JSON_Status json_array_append_null(JSON_Array *array) {
 
 JSON_Status json_object_set_value(JSON_Object *object, const char *name,
                                   JSON_Value *value) {
-  unsigned long hash = 0;
-  parson_bool_t found = PARSON_FALSE;
-  size_t cell_ix = 0;
-  size_t item_ix = 0;
-  JSON_Value *old_value = NULL;
-  char *key_copy = NULL;
-
+  ptrdiff_t idx;
   if (!object || !name || !value || value->parent) {
     return JSONFailure;
   }
-  hash = hash_string(name, strlen(name));
-  found = PARSON_FALSE;
-  cell_ix = json_object_get_cell_ix(object, name, strlen(name), hash, &found);
-  if (found) {
-    item_ix = object->cells[cell_ix];
-    old_value = object->values[item_ix];
-    json_value_free(old_value);
-    object->values[item_ix] = value;
+  idx = shgeti(object->pairs, name);
+  if (idx >= 0) {
+    json_value_free(object->pairs[idx].value);
+    object->pairs[idx].value = value;
     value->parent = json_object_get_wrapping_value(object);
     return JSONSuccess;
   }
-  if (object->count >= object->item_capacity) {
-    JSON_Status res = json_object_grow_and_rehash(object);
-    if (res != JSONSuccess) {
-      return JSONFailure;
-    }
-    cell_ix = json_object_get_cell_ix(object, name, strlen(name), hash, &found);
-  }
-  key_copy = parson_strdup(name);
-  if (!key_copy) {
-    return JSONFailure;
-  }
-  object->names[object->count] = key_copy;
-  object->cells[cell_ix] = object->count;
-  object->values[object->count] = value;
-  object->cell_ixs[object->count] = cell_ix;
-  object->hashes[object->count] = hash;
-  object->count++;
+  shput(object->pairs, name, value);
   value->parent = json_object_get_wrapping_value(object);
   return JSONSuccess;
 }
@@ -2477,20 +2193,17 @@ JSON_Status json_object_dotremove(JSON_Object *object, const char *name) {
 
 JSON_Status json_object_clear(JSON_Object *object) {
   size_t i = 0;
+  size_t count = 0;
   if (object == NULL) {
     return JSONFailure;
   }
-  for (i = 0; i < json_object_get_count(object); i++) {
-    parson_free(object->names[i]);
-    object->names[i] = NULL;
-
-    json_value_free(object->values[i]);
-    object->values[i] = NULL;
+  count = shlenu(object->pairs);
+  for (i = 0; i < count; i++) {
+    json_value_free(object->pairs[i].value);
   }
-  object->count = 0;
-  for (i = 0; i < object->cell_capacity; i++) {
-    object->cells[i] = OBJECT_INVALID_IX;
-  }
+  shfree(object->pairs);
+  object->pairs = NULL;
+  sh_new_strdup(object->pairs);
   return JSONSuccess;
 }
 
