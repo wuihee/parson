@@ -11,4 +11,5 @@
 
 - `json_array_t->items` will be the dynamic array.
 - To keep the interfaces as much as possible, it seems like I need to continue using `JSON_Array` wrapper as the return type.
-- Do I continue mainttaining `count` and `capacity`?
+- Do I continue mainttaining `count` and `capacity`? Chose to remove it.
+- Also chose to remove `json_array_resize`. I had to remove a specific check in `parse_array_value`. Maybe I could've kept `json_array_resize` but made it do nothing?
