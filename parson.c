@@ -156,8 +156,6 @@ struct json_object_t {
 struct json_array_t {
   JSON_Value *wrapping_value;
   JSON_Value **items;
-  size_t count;
-  size_t capacity;
 };
 
 /* Various */
@@ -201,7 +199,7 @@ static void json_object_free(JSON_Object *object);
 /* JSON Array */
 static JSON_Array *json_array_make(JSON_Value *wrapping_value);
 static JSON_Status json_array_add(JSON_Array *array, JSON_Value *value);
-static JSON_Status json_array_resize(JSON_Array *array, size_t new_capacity);
+// static JSON_Status json_array_resize(JSON_Array *array, size_t new_capacity);
 static void json_array_free(JSON_Array *array);
 
 /* JSON Value */
@@ -767,48 +765,40 @@ static JSON_Array *json_array_make(JSON_Value *wrapping_value) {
   }
   new_array->wrapping_value = wrapping_value;
   new_array->items = (JSON_Value **)NULL;
-  new_array->capacity = 0;
-  new_array->count = 0;
   return new_array;
 }
 
 static JSON_Status json_array_add(JSON_Array *array, JSON_Value *value) {
-  if (array->count >= array->capacity) {
-    size_t new_capacity = MAX(array->capacity * 2, STARTING_CAPACITY);
-    if (json_array_resize(array, new_capacity) != JSONSuccess) {
-      return JSONFailure;
-    }
-  }
   value->parent = json_array_get_wrapping_value(array);
-  array->items[array->count] = value;
-  array->count++;
+  arrput(array->items, value);
   return JSONSuccess;
 }
 
-static JSON_Status json_array_resize(JSON_Array *array, size_t new_capacity) {
-  JSON_Value **new_items = NULL;
-  if (new_capacity == 0) {
-    return JSONFailure;
-  }
-  new_items = (JSON_Value **)parson_malloc(new_capacity * sizeof(JSON_Value *));
-  if (new_items == NULL) {
-    return JSONFailure;
-  }
-  if (array->items != NULL && array->count > 0) {
-    memcpy(new_items, array->items, array->count * sizeof(JSON_Value *));
-  }
-  parson_free(array->items);
-  array->items = new_items;
-  array->capacity = new_capacity;
-  return JSONSuccess;
-}
+// static JSON_Status json_array_resize(JSON_Array *array, size_t new_capacity)
+// {
+//   JSON_Value **new_items = NULL;
+//   if (new_capacity == 0) {
+//     return JSONFailure;
+//   }
+//   new_items = (JSON_Value **)parson_malloc(new_capacity * sizeof(JSON_Value
+//   *)); if (new_items == NULL) {
+//     return JSONFailure;
+//   }
+//   if (array->items != NULL && array->count > 0) {
+//     memcpy(new_items, array->items, array->count * sizeof(JSON_Value *));
+//   }
+//   parson_free(array->items);
+//   array->items = new_items;
+//   array->capacity = new_capacity;
+//   return JSONSuccess;
+// }
 
 static void json_array_free(JSON_Array *array) {
   size_t i;
-  for (i = 0; i < array->count; i++) {
+  for (i = 0; i < arrlenu(array->items); i++) {
     json_value_free(array->items[i]);
   }
-  parson_free(array->items);
+  arrfree(array->items);
   parson_free(array);
 }
 
@@ -1131,9 +1121,7 @@ static JSON_Value *parse_array_value(const char **string, size_t nesting) {
     }
   }
   SKIP_WHITESPACES(string);
-  if (**string != ']' || /* Trim array after parsing is over */
-      json_array_resize(output_array, json_array_get_count(output_array)) !=
-          JSONSuccess) {
+  if (**string != ']') {
     json_value_free(output_value);
     return NULL;
   }
@@ -1706,7 +1694,7 @@ int json_array_get_boolean(const JSON_Array *array, size_t index) {
 }
 
 size_t json_array_get_count(const JSON_Array *array) {
-  return array ? array->count : 0;
+  return array ? arrlen(array->items) : 0;
 }
 
 JSON_Value *json_array_get_wrapping_value(const JSON_Array *array) {
@@ -2088,14 +2076,11 @@ char *json_serialize_to_string_pretty(const JSON_Value *value) {
 void json_free_serialized_string(char *string) { parson_free(string); }
 
 JSON_Status json_array_remove(JSON_Array *array, size_t ix) {
-  size_t to_move_bytes = 0;
   if (array == NULL || ix >= json_array_get_count(array)) {
     return JSONFailure;
   }
   json_value_free(json_array_get_value(array, ix));
-  to_move_bytes = (json_array_get_count(array) - 1 - ix) * sizeof(JSON_Value *);
-  memmove(array->items + ix, array->items + ix + 1, to_move_bytes);
-  array->count -= 1;
+  arrdel(array->items, ix);
   return JSONSuccess;
 }
 
@@ -2183,7 +2168,6 @@ JSON_Status json_array_clear(JSON_Array *array) {
   for (i = 0; i < json_array_get_count(array); i++) {
     json_value_free(json_array_get_value(array, i));
   }
-  array->count = 0;
   return JSONSuccess;
 }
 
